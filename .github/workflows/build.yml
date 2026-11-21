@@ -1,0 +1,120 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Web files
+        run: |
+          mkdir -p www
+          cp index.html www/index.html
+      - run: npm install
+      - name: Create Android project
+        run: |
+          npx cap init VetShelf com.vetshelf.app --web-dir www
+          npx cap add android
+          npx cap sync android
+      - name: Native PDF plugin
+        run: |
+          D=android/app/src/main/java/com/vetshelf/app
+          cat > $D/MainActivity.java <<'EOF'
+          package com.vetshelf.app;
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle b) {
+              registerPlugin(VetNativePlugin.class);
+              super.onCreate(b);
+            }
+          }
+          EOF
+          cat > $D/VetNativePlugin.java <<'EOF'
+          package com.vetshelf.app;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.provider.OpenableColumns;
+          import androidx.activity.result.ActivityResult;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.ActivityCallback;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          @CapacitorPlugin(name = "VetNative")
+          public class VetNativePlugin extends Plugin {
+            @PluginMethod
+            public void pick(PluginCall call) {
+              Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+              i.addCategory(Intent.CATEGORY_OPENABLE);
+              i.setType("application/pdf");
+              i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+              startActivityForResult(call, i, "pickDone");
+            }
+            @ActivityCallback
+            private void pickDone(PluginCall call, ActivityResult result) {
+              if (call == null) return;
+              Intent d = result.getData();
+              if (result.getResultCode() != Activity.RESULT_OK || d == null || d.getData() == null) {
+                call.reject("cancelled");
+                return;
+              }
+              Uri u = d.getData();
+              try {
+                getContext().getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+              } catch (Exception e) {}
+              String name = "PDF";
+              try (Cursor c = getContext().getContentResolver().query(u, null, null, null, null)) {
+                if (c != null && c.moveToFirst()) {
+                  int ix = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                  if (ix >= 0) name = c.getString(ix);
+                }
+              } catch (Exception e) {}
+              JSObject r = new JSObject();
+              r.put("uri", u.toString());
+              r.put("name", name);
+              call.resolve(r);
+            }
+            @PluginMethod
+            public void open(PluginCall call) {
+              String uri = call.getString("uri");
+              if (uri == null) { call.reject("no uri"); return; }
+              Intent i = new Intent(Intent.ACTION_VIEW);
+              i.setDataAndType(Uri.parse(uri), "application/pdf");
+              i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+              try {
+                i.setPackage("com.xodo.pdf.reader");
+                getContext().startActivity(i);
+                call.resolve();
+              } catch (Exception e) {
+                try {
+                  i.setPackage(null);
+                  getContext().startActivity(i);
+                  call.resolve();
+                } catch (Exception e2) { call.reject("no app"); }
+              }
+            }
+          }
+          EOF
+      - name: Build
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VetShelf-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
